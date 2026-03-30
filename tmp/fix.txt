@@ -1,0 +1,219 @@
+public function dealerSummaryReport(Request $request)
+    {
+        $branches = BranchesList::all();
+        
+        // Check if it's the initial page load (no form submission)
+        if (!$request->has('fromDate') || !$request->has('toDate')) {
+            return view('DealerReports.dealersummary_report', [
+                'summaryData' => [],
+                'fromDate' => null,
+                'toDate' => null,
+                'showReport' => false,
+                'branches' => $branches, 
+                'selectedBranch' => null 
+            ]);
+        }
+        
+        $request->validate([
+            'fromDate' => 'required|date',
+            'toDate' => 'required|date|after_or_equal:fromDate'
+        ]);
+        
+        $fromDate = $request->get('fromDate');
+        $toDate = $request->get('toDate');
+        $selectedBranchCode = $request->get('location_category'); // Get selected branch code
+        
+        try {
+            // First, let's debug the API response to see what fields are available
+            // Fetch data from API with 10 minute timeout
+            $apiUrl = "http://172.16.22.204/dashboardApi/autosecure/getDealerClaims.php";
+            
+            // Prepare API parameters - Add branch filter if selected
+            $apiParams = [
+                'fromDate' => $fromDate,
+                'toDate' => $toDate
+            ];
+            
+            // If branch is selected, we need to check what branch field the API expects
+            // Based on your other methods, it seems like 'loccode' is the parameter
+            if ($selectedBranchCode) {
+                $selectedBranch = BranchesList::where('fbracode', $selectedBranchCode)->first();
+                if ($selectedBranch) {
+                    // Try different parameter names based on what the API expects
+                    // Uncomment the one that works based on your API documentation
+                    // $apiParams['loccode'] = $selectedBranchCode;
+                    // $apiParams['branch'] = $selectedBranchCode;
+                    // $apiParams['location'] = $selectedBranchCode;
+                    $apiParams['loccode'] = $selectedBranchCode;
+                    $apiParams['loctak'] = $selectedBranch->fbratak ?? null;
+                }
+            }
+            
+            Log::info("DealerSummaryReport: Fetching data with params", $apiParams);
+            
+            $response = Http::timeout(600)->get($apiUrl, $apiParams);
+            
+            if ($response->successful()) {
+                $data = $response->json();
+                
+                // Debug: Log the structure of first claim to see available fields
+                if (isset($data['autosecure']['data']) && count($data['autosecure']['data']) > 0) {
+                    $firstClaim = $data['autosecure']['data'][0];
+                    Log::info("DealerSummaryReport: First claim structure", array_keys($firstClaim));
+                    
+                    // Log all available fields in the claim
+                    foreach ($firstClaim as $key => $value) {
+                        Log::debug("DealerSummaryReport: Field '{$key}' = '{$value}'");
+                    }
+                }
+                
+                // Check if API returned expected data structure
+                if (!isset($data['autosecure']) || !isset($data['autosecure']['data'])) {
+                    return view('DealerReports.dealersummary_report', [
+                        'summaryData' => [],
+                        'fromDate' => $fromDate,
+                        'toDate' => $toDate,
+                        'showReport' => true,
+                        'branches' => $branches,
+                        'selectedBranch' => $selectedBranchCode,
+                        'info' => 'No data found for the selected period.'
+                    ]);
+                }
+                
+                // Get autosecure data and process GIS data
+                $autosecureData = $data['autosecure']['data'] ?? [];
+                $gisData = $data['gis'] ?? [];
+                
+                // Create a lookup array for GIS claims
+                $gisLookup = [];
+                foreach ($gisData as $gis) {
+                    if (isset($gis['GID_BASEDOCUMENTNO'])) {
+                        $gisLookup[$gis['GID_BASEDOCUMENTNO']] = $gis['TOT_CLM'] ?? 0;
+                    }
+                }
+                
+                // Process and group data by dealer_code
+                $dealerSummary = [];
+                
+                foreach ($autosecureData as $claim) {
+                    $dealerCode = $claim['dealer_code'] ?? 'Unknown';
+                    $gisNumber = $claim['gis'] ?? '';
+                    
+                    // IMPORTANT: Identify the correct branch field in your claim data
+                    // Common field names for branch: 'branch_code', 'location', 'loc_code', 'branch'
+                    // Let's check which field exists
+                    $claimBranchCode = null;
+                    
+                    // Check common branch field names
+                    if (isset($claim['branch_code'])) {
+                        $claimBranchCode = $claim['branch_code'];
+                    } elseif (isset($claim['location'])) {
+                        $claimBranchCode = $claim['location'];
+                    } elseif (isset($claim['loc_code'])) {
+                        $claimBranchCode = $claim['loc_code'];
+                    } elseif (isset($claim['branch'])) {
+                        $claimBranchCode = $claim['branch'];
+                    } elseif (isset($claim['loc'])) {
+                        $claimBranchCode = $claim['loc'];
+                    }
+                    
+                    // Log for debugging
+                    if ($selectedBranchCode && $claimBranchCode) {
+                        Log::debug("DealerSummaryReport: Comparing selected branch '{$selectedBranchCode}' with claim branch '{$claimBranchCode}'");
+                    }
+                    
+                    // Filter by branch if selected
+                    // Note: The API might already be filtering by branch, so this might not be necessary
+                    // But we'll keep it for client-side filtering if needed
+                    if ($selectedBranchCode && $claimBranchCode && $claimBranchCode != $selectedBranchCode) {
+                        continue; // Skip claims not from selected branch
+                    }
+                    
+                    // Get TOT_CLM from GIS lookup or default to 0
+                    $totClm = isset($gisLookup[$gisNumber]) ? (float)$gisLookup[$gisNumber] : 0;
+                    
+                    // Get premium and iev values
+                    $premium = isset($claim['premium']) ? (float)$claim['premium'] : 0;
+                    $iev = isset($claim['iev']) ? (float)$claim['iev'] : 0;
+                    
+                    // Initialize dealer summary if not exists
+                    if (!isset($dealerSummary[$dealerCode])) {
+                        $dealerSummary[$dealerCode] = [
+                            'dealer_code' => $dealerCode,
+                            'count' => 0,
+                            'iev_sum' => 0,
+                            'premium_sum' => 0,
+                            'totclaims_sum' => 0
+                        ];
+                    }
+                    
+                    // Update dealer summary
+                    $dealerSummary[$dealerCode]['count']++;
+                    $dealerSummary[$dealerCode]['iev_sum'] += $iev;
+                    $dealerSummary[$dealerCode]['premium_sum'] += $premium;
+                    $dealerSummary[$dealerCode]['totclaims_sum'] += $totClm;
+                }
+                
+                // Convert associative array to indexed array for easier use in view
+                $summaryData = array_values($dealerSummary);
+                
+                // Sort by count (descending)
+                usort($summaryData, function($a, $b) {
+                    return $b['count'] - $a['count'];
+                });
+                
+                $recordCount = count($summaryData);
+                
+                // Prepare success message
+                $branchInfo = '';
+                if ($selectedBranchCode) {
+                    $branchName = BranchesList::where('fbracode', $selectedBranchCode)->first()->fbradsc ?? $selectedBranchCode;
+                    $branchInfo = " for branch: {$branchName}";
+                }
+                
+                if ($recordCount == 0) {
+                    $info = "No data found{$branchInfo} in the selected period.";
+                } else {
+                    $info = "Dealer Summary Report generated successfully! Found {$recordCount} dealers{$branchInfo}.";
+                }
+                
+                return view('DealerReports.dealersummary_report', [
+                    'summaryData' => $summaryData,
+                    'fromDate' => $fromDate,
+                    'toDate' => $toDate,
+                    'showReport' => true,
+                    'branches' => $branches,
+                    'selectedBranch' => $selectedBranchCode,
+                    'success' => $info
+                ]);
+                
+            } else {
+                $statusCode = $response->status();
+                
+                return view('DealerReports.dealersummary_report', [
+                    'summaryData' => [],
+                    'error' => "API Request Failed (Status: {$statusCode})",
+                    'fromDate' => $fromDate,
+                    'toDate' => $toDate,
+                    'showReport' => false,
+                    'branches' => $branches,
+                    'selectedBranch' => $selectedBranchCode
+                ]);
+            }
+            
+        } catch (\Exception $e) {
+            Log::error("DealerSummaryReport: Error - " . $e->getMessage(), [
+                'trace' => $e->getTraceAsString()
+            ]);
+            
+            return view('DealerReports.dealersummary_report', [
+                'summaryData' => [],
+                'error' => 'Error: ' . $e->getMessage(),
+                'fromDate' => $fromDate,
+                'toDate' => $toDate,
+                'showReport' => false,
+                'branches' => $branches,
+                'selectedBranch' => $selectedBranchCode
+            ]);
+        }
+    }

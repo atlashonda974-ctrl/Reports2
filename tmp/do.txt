@@ -1,0 +1,127 @@
+public function dosummaryReport(Request $request)
+{
+    
+    if (!$request->has('fromDate') || !$request->has('toDate')) {
+        return view('DealerReports.DoSummary-report', [
+            'summaryData' => [],
+            'fromDate' => null,
+            'toDate' => null,
+            'showReport' => false
+        ]);
+    }
+    
+    $request->validate([
+        'fromDate' => 'required|date',
+        'toDate' => 'required|date|after_or_equal:fromDate'
+    ]);
+    
+    $fromDate = $request->get('fromDate');
+    $toDate = $request->get('toDate');
+    
+    try {
+        
+        $apiUrl = "http://172.16.22.204/dashboardApi/autosecure/getDealerClaims.php";
+        
+        $response = Http::timeout(600)->get($apiUrl, [
+            'fromDate' => $fromDate,
+            'toDate' => $toDate
+        ]);
+        
+        if ($response->successful()) {
+            $data = $response->json();
+            
+           
+            if (!isset($data['autosecure']) || !isset($data['autosecure']['data'])) {
+                return view('DealerReports.DoSummary-report', [
+                    'summaryData' => [],
+                    'fromDate' => $fromDate,
+                    'toDate' => $toDate,
+                    'showReport' => true,
+                    'info' => 'No data found for the selected period.'
+                ]);
+            }
+            
+           
+            $autosecureData = $data['autosecure']['data'] ?? [];
+            $gisData = $data['gis'] ?? [];
+            
+            $gisLookup = [];
+            foreach ($gisData as $gis) {
+                if (isset($gis['GID_BASEDOCUMENTNO'])) {
+                    $gisLookup[$gis['GID_BASEDOCUMENTNO']] = $gis['TOT_CLM'] ?? 0;
+                }
+            }
+         
+            $doSummary = [];
+            
+            foreach ($autosecureData as $claim) {
+                $doName = $claim['con_per'] ?? 'Unknown D/O';
+                $gisNumber = $claim['gis'] ?? '';
+                
+        
+                $totClm = isset($gisLookup[$gisNumber]) ? (float)$gisLookup[$gisNumber] : 0;
+                
+           
+                $premium = isset($claim['premium']) ? (float)$claim['premium'] : 0;
+                $iev = isset($claim['iev']) ? (float)$claim['iev'] : 0;
+                
+        
+                if (!isset($doSummary[$doName])) {
+                    $doSummary[$doName] = [
+                        'do_name' => $doName,
+                        'count' => 0,
+                        'iev_sum' => 0,
+                        'premium_sum' => 0,
+                        'totclaims_sum' => 0
+                    ];
+                }
+                
+            
+                $doSummary[$doName]['count']++;
+                $doSummary[$doName]['iev_sum'] += $iev;
+                $doSummary[$doName]['premium_sum'] += $premium;
+                $doSummary[$doName]['totclaims_sum'] += $totClm;
+            }
+            
+        
+            $summaryData = array_values($doSummary);
+            
+        
+            usort($summaryData, function($a, $b) {
+                return $b['count'] - $a['count'];
+            });
+            
+            $recordCount = count($summaryData);
+            
+            return view('DealerReports.DoSummary-report', [
+                'summaryData' => $summaryData,
+                'fromDate' => $fromDate,
+                'toDate' => $toDate,
+                'showReport' => true,
+                'success' => "D/O Summary Report generated successfully! Found {$recordCount} D/Os."
+            ]);
+            
+        } else {
+            $statusCode = $response->status();
+            
+            return view('DealerReports.DoSummary-report', [
+                'summaryData' => [],
+                'error' => "API Request Failed (Status: {$statusCode})",
+                'fromDate' => $fromDate,
+                'toDate' => $toDate,
+                'showReport' => false
+            ]);
+        }
+        
+    } catch (\Exception $e) {
+        \Log::error("DOSummaryReport: Error - " . $e->getMessage());
+        
+        return view('DealerReports.DoSummary-report', [
+            'summaryData' => [],
+            'error' => 'Error: ' . $e->getMessage(),
+            'fromDate' => $fromDate,
+            'toDate' => $toDate,
+            'showReport' => false
+        ]);
+    }
+}
